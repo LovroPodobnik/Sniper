@@ -6,7 +6,7 @@ export interface MintsDataReponse {
 export interface QuoteResponse {
   // Define the expected structure of the response here
   // Adjust based on the actual API response
-  data: any; // Replace `any` with the specific type if known
+  data: unknown; // Replace `any` with the specific type if known
 }
 
 export interface SerializedQuoteResponse {
@@ -40,7 +40,7 @@ export interface RugResponseExtended {
     isInitialized: boolean;
     freezeAuthority: string | null;
   };
-  token_extensions: any | null;
+  token_extensions: unknown | null;
   tokenMeta: {
     name: string;
     symbol: string;
@@ -74,9 +74,9 @@ export interface RugResponseExtended {
     symbol: string;
     image: string;
   };
-  lockerOwners: Record<string, any>;
-  lockers: Record<string, any>;
-  lpLockers: any | null;
+  lockerOwners: Record<string, unknown>;
+  lockers: Record<string, unknown>;
+  lpLockers: unknown | null;
   markets: {
     pubkey: string;
     marketType: string;
@@ -95,7 +95,7 @@ export interface WebSocketRequest {
   jsonrpc: string;
   id: number;
   method: string;
-  params: Array<object>;
+  params: unknown[]; // Must be an array for both subscribe and unsubscribe
 }
 
 interface TransactionDetailsResponse {

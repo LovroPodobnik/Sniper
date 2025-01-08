@@ -3,9 +3,13 @@ import dotenv from "dotenv"; // zero-dependency module that loads environment va
 import { WebSocketRequest } from "./types"; // Typescript Types for type safety
 import { config } from "./config"; // Configuration parameters for our bot
 import { fetchTransactionDetails, createSwapTransaction, getRugCheckConfirmed, fetchAndSaveSwapDetails } from "./transactions";
+import { validateEnv } from "./utils/env-validator";
 
 // Load environment variables from the .env file
 dotenv.config();
+
+// Validate environment variables before starting
+const env = validateEnv();
 let activeTransactions = 0;
 const MAX_CONCURRENT = config.tx.concurrent_transactions;
 
@@ -20,22 +24,15 @@ function sendSubscribeRequest(ws: WebSocket): void {
         mentions: [config.liquidity_pool.radiyum_program_id],
       },
       {
-        commitment: "processed", // Can use finalized to be more accurate.
+        commitment: "confirmed"
       },
     ],
   };
+  console.log("📤 Sending subscription request:", JSON.stringify(request, null, 2));
   ws.send(JSON.stringify(request));
 }
+
 // Function used to close other connections
-function sendUnsubscribeRequest(ws: WebSocket): void {
-  const request: WebSocketRequest = {
-    jsonrpc: "2.0",
-    id: 1,
-    method: "logsUnsubscribe",
-    params: [],
-  };
-  ws.send(JSON.stringify(request));
-}
 
 // Function used to handle the transaction once a new pool creation is found
 async function processTransaction(signature: string): Promise<void> {
@@ -109,7 +106,7 @@ async function processTransaction(signature: string): Promise<void> {
 let init = false;
 async function websocketHandler(): Promise<void> {
   // Create a WebSocket connection
-  let ws: WebSocket | null = new WebSocket(process.env.HELIUS_WSS_URI || "");
+  let ws: WebSocket | null = new WebSocket(env.HELIUS_WSS_URI);
   if (!init) console.clear();
 
   // @TODO, test with hosting our app on a Cloud instance closer to the RPC nodes physical location for minimal latency
@@ -117,34 +114,60 @@ async function websocketHandler(): Promise<void> {
 
   // Send subscription to the websocket once the connection is open
   ws.on("open", () => {
-    // Unsubscribe
-    if (ws && !init) sendUnsubscribeRequest(ws); // Send a request once the WebSocket is open
+    console.log("\n🔄 WebSocket connection opened, sending subscription request...");
     // Subscribe
-    if (ws) sendSubscribeRequest(ws); // Send a request once the WebSocket is open
-    console.log("\n🔓 WebSocket is open and listening.");
+    if (ws) {
+      sendSubscribeRequest(ws);
+      console.log("📨 Subscription request sent");
+    }
+    console.log("🔓 WebSocket is open and listening.");
     init = true;
   });
 
   // Logic for the message event for the .on event listener
   ws.on("message", async (data: WebSocket.Data) => {
     try {
-      const jsonString = data.toString(); // Convert data to a string
-      const parsedData = JSON.parse(jsonString); // Parse the JSON string
+        const jsonString = data.toString();
+        const parsedData = JSON.parse(jsonString);
+        
+        // Handle subscription response
+        if (parsedData.result !== undefined && !parsedData.error) {
+            console.log("✅ Subscription confirmed");
+            return;
+        }
 
-      // Safely access the nested structure
-      const logs = parsedData?.params?.result?.value?.logs;
-      const signature = parsedData?.params?.result?.value?.signature;
+        // Only log RPC errors for debugging
+        if (parsedData.error) {
+            console.error("🚫 RPC Error:", parsedData.error);
+            return;
+        }
 
-      // Validate `logs` is an array
-      if (Array.isArray(logs)) {
-        // Verify if this is a new pool creation
-        const containsCreate = logs.some((log: string) => typeof log === "string" && log.includes("Program log: initialize2: InitializeInstruction2"));
-        if (!containsCreate || typeof signature !== "string") return;
+        // Safely access the nested structure
+        const logs = parsedData?.params?.result?.value?.logs;
+        const signature = parsedData?.params?.result?.value?.signature;
+
+        // Skip if no logs or signature
+        if (!Array.isArray(logs) || !signature) return;
+
+        // Check if this is a pool creation
+        const containsCreate = logs.some((log: string) => 
+            typeof log === "string" && 
+            log.includes("Program log: initialize2: InitializeInstruction2")
+        );
+        
+        // Only proceed if it's a pool creation
+        if (!containsCreate) return;
+
+        // Log pool creation
+        console.log('🎯 New Pool Creation Detected:', {
+            signature,
+            solscanLink: `https://solscan.io/tx/${signature}`,
+        });
 
         // Verify if we have reached the max concurrent transactions
         if (activeTransactions >= MAX_CONCURRENT) {
-          console.log("⏳ Max concurrent transactions reached, skipping...");
-          return;
+            console.log("⏳ Max concurrent transactions reached, skipping...");
+            return;
         }
 
         // Add additional concurrent transaction
@@ -152,25 +175,31 @@ async function websocketHandler(): Promise<void> {
 
         // Process transaction asynchronously
         processTransaction(signature)
-          .catch((error) => {
-            console.error("Error processing transaction:", error);
-          })
-          .finally(() => {
-            activeTransactions--;
-          });
-      }
+            .catch((error) => {
+                console.error("Error processing transaction:", error);
+            })
+            .finally(() => {
+                activeTransactions--;
+            });
     } catch (error) {
-      console.error("Error parsing JSON or processing data:", error);
+        console.error("💥 Error processing message:", {
+            error: error instanceof Error ? error.message : 'Unknown error',
+            timestamp: new Date().toISOString()
+        });
     }
   });
 
   ws.on("error", (err: Error) => {
-    console.error("WebSocket error:", err);
+    console.error("�� WebSocket error:", err);
   });
 
   ws.on("close", () => {
-    // Connection closed, discard old websocket and create a new one in 5 seconds
-    ws = null;
+    console.log("📴 WebSocket connection closed, cleaning up...");
+    if (ws) {
+      ws.removeAllListeners();
+      ws = null;
+    }
+    console.log("🔄 Attempting to reconnect in 5 seconds...");
     setTimeout(websocketHandler, 5000);
   });
 }
