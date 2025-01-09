@@ -5,16 +5,20 @@ import bs58 from "bs58";
 import dotenv from "dotenv";
 import { config } from "./config";
 import {
-  TransactionDetailsResponseArray,
   MintsDataReponse,
   QuoteResponse,
   SerializedQuoteResponse,
   SwapEventDetailsResponse,
   HoldingRecord,
-  RugResponseExtended,
   NewTokenRecord,
+  HeliusTransactionResponse,
+  JupiterPriceResponse,
+  ErrorResponse,
+  RugResponseExtended
 } from "./types";
 import { insertHolding, insertNewToken, removeHolding, selectTokenByMint, selectTokenByNameAndCreator } from "./tracker/db";
+import { checkTokenBalance } from "./utils/token-balance";
+import { formatNumber } from "./utils/format";
 
 // Load environment variables from the .env file
 dotenv.config();
@@ -23,18 +27,28 @@ export async function fetchTransactionDetails(signature: string): Promise<MintsD
   // Set function constants
   const txUrl = process.env.HELIUS_HTTPS_URI_TX || "";
   const maxRetries = config.tx.fetch_tx_max_retries;
-  let retryCount = 0;
+  const retryCount = 0;
 
   // Add longer initial delay to allow transaction to be processed
-  console.log("Waiting " + config.tx.fetch_tx_initial_delay / 1000 + " seconds for transaction to be confirmed...");
+  console.log("\n⏳ Initial delay: waiting " + config.tx.fetch_tx_initial_delay / 1000 + " seconds for transaction to be confirmed...");
   await new Promise((resolve) => setTimeout(resolve, config.tx.fetch_tx_initial_delay));
 
-  while (retryCount < maxRetries) {
+  for (let attempt = retryCount; attempt < maxRetries; attempt++) {
     try {
       // Output logs
-      console.log(`Attempt ${retryCount + 1} of ${maxRetries} to fetch transaction details...`);
+      console.log(`\n🔄 Attempt ${attempt + 1} of ${maxRetries} to fetch transaction details...`);
 
-      const response = await axios.post<any>(
+      // Log the request we're about to make if verbose logging is enabled
+      if (config.swap.verbose_log) {
+        console.log("📤 Request URL:", txUrl);
+        console.log("📤 Request Body:", {
+          transactions: [signature],
+          commitment: "finalized",
+          encoding: "jsonParsed",
+        });
+      }
+
+      const response = await axios.post<HeliusTransactionResponse>(
         txUrl,
         {
           transactions: [signature],
@@ -49,37 +63,54 @@ export async function fetchTransactionDetails(signature: string): Promise<MintsD
         }
       );
 
-      // Verify if a response was received
+      // Debug response if verbose logging is enabled
+      if (config.swap.verbose_log) {
+        console.log("\n📥 Raw API Response:", JSON.stringify(response.data, null, 2));
+      }
+
+      // Verify if we received a valid response
       if (!response.data) {
-        throw new Error("No response data received");
+        throw new Error("Empty response from API");
       }
 
-      // Verify if the response was in the correct format and not empty
-      if (!Array.isArray(response.data) || response.data.length === 0) {
-        throw new Error("Response data array is empty");
+      // Handle both array and object response formats
+      const transactions = Array.isArray(response.data) ? response.data : response.data.transactions;
+      
+      if (!transactions || transactions.length === 0) {
+        throw new Error("Transaction not found in response");
       }
 
-      // Access the `data` property which contains the array of transactions
-      const transactions: TransactionDetailsResponseArray = response.data;
-
-      // Verify if transaction details were found
-      if (!transactions[0]) {
-        throw new Error("Transaction not found");
+      const transaction = transactions[0];
+      if (!transaction) {
+        throw new Error("Transaction details are null");
       }
 
-      // Access the `instructions` property which contains account instructions
-      const instructions = transactions[0].instructions;
-      if (!instructions || !Array.isArray(instructions) || instructions.length === 0) {
-        throw new Error("No instructions found in transaction");
+      // Access the instructions property which contains account instructions
+      const instructions = transaction.instructions;
+      if (!instructions || !Array.isArray(instructions)) {
+        throw new Error("No instructions array in transaction");
+      }
+
+      if (instructions.length === 0) {
+        throw new Error("Instructions array is empty");
+      }
+
+      // Log all program IDs if verbose logging is enabled
+      if (config.swap.verbose_log) {
+        console.log("\n🔍 Found Program IDs in transaction:");
+        instructions.forEach((ix, index) => {
+          console.log(`- Instruction ${index + 1}: ${ix.programId}`);
+        });
       }
 
       // Verify and find the instructions for the correct market maker id
       const instruction = instructions.find((ix) => ix.programId === config.liquidity_pool.radiyum_program_id);
       if (!instruction || !instruction.accounts) {
-        throw new Error("No market maker instruction found");
+        throw new Error(`No Raydium instruction found (looking for ${config.liquidity_pool.radiyum_program_id})`);
       }
+
       if (!Array.isArray(instruction.accounts) || instruction.accounts.length < 10) {
-        throw new Error("Invalid accounts array in instruction");
+        throw new Error(`Invalid Raydium instruction format (found ${instruction.accounts.length} accounts, expected >= 10)`);
       }
 
       // Store quote and token mints
@@ -88,7 +119,7 @@ export async function fetchTransactionDetails(signature: string): Promise<MintsD
 
       // Verify if we received both quote and token mints
       if (!accountOne || !accountTwo) {
-        throw new Error("Required accounts not found");
+        throw new Error("Required token accounts not found in positions 8 and 9");
       }
 
       // Set new token and SOL mint
@@ -103,9 +134,9 @@ export async function fetchTransactionDetails(signature: string): Promise<MintsD
       }
 
       // Output logs
-      console.log("Successfully fetched transaction details!");
-      console.log(`SOL Token Account: ${solTokenAccount}`);
-      console.log(`New Token Account: ${newTokenAccount}`);
+      console.log("\n✅ Successfully fetched transaction details!");
+      console.log(`💰 SOL Token Account: ${solTokenAccount}`);
+      console.log(`🪙 New Token Account: ${newTokenAccount}\n`);
 
       const displayData: MintsDataReponse = {
         tokenMint: newTokenAccount,
@@ -113,20 +144,20 @@ export async function fetchTransactionDetails(signature: string): Promise<MintsD
       };
 
       return displayData;
-    } catch (error: any) {
-      console.log(`Attempt ${retryCount + 1} failed: ${error.message}`);
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      console.log(`\n❌ Attempt ${attempt + 1} failed: ${errorMessage}`);
 
-      retryCount++;
-
-      if (retryCount < maxRetries) {
-        const delay = Math.min(4000 * Math.pow(1.5, retryCount), 15000);
-        console.log(`Waiting ${delay / 1000} seconds before next attempt...`);
+      // If we have more retries, wait before trying again
+      if (attempt + 1 < maxRetries) {
+        const delay = Math.min(4000 * Math.pow(2, attempt), 15000); // Exponential backoff with 15s max
+        console.log(`⏳ Waiting ${delay / 1000} seconds before next attempt...`);
         await new Promise((resolve) => setTimeout(resolve, delay));
       }
     }
   }
 
-  console.log("All attempts to fetch transaction details failed");
+  console.log("\n❌ All attempts to fetch transaction details failed");
   return null;
 }
 
@@ -135,377 +166,373 @@ export async function createSwapTransaction(solMint: string, tokenMint: string):
   const swapUrl = process.env.JUP_HTTPS_SWAP_URI || "";
   const rpcUrl = process.env.HELIUS_HTTPS_URI || "";
   const myWallet = new Wallet(Keypair.fromSecretKey(bs58.decode(process.env.PRIV_KEY_WALLET || "")));
-  let quoteResponseData: QuoteResponse | null = null;
-  let serializedQuoteResponseData: SerializedQuoteResponse | null = null;
+  const connection = new Connection(rpcUrl);
 
-  // Get Swap Quote
-  let retryCount = 0;
-  while (retryCount < config.swap.token_not_tradable_400_error_retries) {
-    try {
-      // Request a quote in order to swap SOL for new token
-      const quoteResponse = await axios.get<QuoteResponse>(quoteUrl, {
-        params: {
-          inputMint: solMint,
-          outputMint: tokenMint,
-          amount: config.swap.amount,
-          slippageBps: config.swap.slippageBps,
-        },
-        timeout: config.tx.get_timeout,
-      });
-
-      if (!quoteResponse.data) return null;
-
-      if (config.swap.verbose_log && config.swap.verbose_log === true) {
-        console.log("\nVerbose log:");
-        console.log(quoteResponse.data);
-      }
-
-      quoteResponseData = quoteResponse.data; // Store the successful response
-      break;
-    } catch (error: any) {
-      // Retry when error is TOKEN_NOT_TRADABLE
-      if (error.response && error.response.status === 400) {
-        const errorData = error.response.data;
-        if (errorData.errorCode === "TOKEN_NOT_TRADABLE") {
-          retryCount++;
-          await new Promise((resolve) => setTimeout(resolve, config.swap.token_not_tradable_400_error_delay));
-          continue; // Retry
-        }
-      }
-
-      // Throw error (null) when error is not TOKEN_NOT_TRADABLE
-      console.error("Error while requesting a new swap quote:", error.message);
-      if (config.swap.verbose_log && config.swap.verbose_log === true) {
-        console.log("Verbose Error Message:");
-        if (error.response) {
-          // Server responded with a status other than 2xx
-          console.error("Error Status:", error.response.status);
-          console.error("Error Status Text:", error.response.statusText);
-          console.error("Error Data:", error.response.data); // API error message
-          console.error("Error Headers:", error.response.headers);
-        } else if (error.request) {
-          // Request was made but no response was received
-          console.error("No Response:", error.request);
-        } else {
-          // Other errors
-          console.error("Error Message:", error.message);
-        }
-      }
-      return null;
-    }
-  }
-
-  // Serialize the quote into a swap transaction that can be submitted on chain
   try {
-    if (!quoteResponseData) return null;
-
-    const swapResponse = await axios.post<SerializedQuoteResponse>(
-      swapUrl,
-      JSON.stringify({
-        // quoteResponse from /quote api
-        quoteResponse: quoteResponseData,
-        // user public key to be used for the swap
-        userPublicKey: myWallet.publicKey.toString(),
-        // auto wrap and unwrap SOL. default is true
-        wrapAndUnwrapSol: true,
-        //dynamicComputeUnitLimit: true, // allow dynamic compute limit instead of max 1,400,000
-        dynamicSlippage: {
-          // This will set an optimized slippage to ensure high success rate
-          maxBps: 300, // Make sure to set a reasonable cap here to prevent MEV
-        },
-        prioritizationFeeLamports: {
-          priorityLevelWithMaxLamports: {
-            maxLamports: config.swap.prio_fee_max_lamports,
-            priorityLevel: config.swap.prio_level,
+    // Get Swap Quote
+    let retryCount = 0;
+    while (retryCount < config.swap.token_not_tradable_400_error_retries) {
+      try {
+        // Request a quote in order to swap SOL for new token
+        const quoteResponse = await axios.get<QuoteResponse>(quoteUrl, {
+          params: {
+            inputMint: solMint,
+            outputMint: tokenMint,
+            amount: config.swap.amount,
+            slippageBps: config.swap.slippageBps,
           },
-        },
-      }),
-      {
-        headers: {
-          "Content-Type": "application/json",
-        },
-        timeout: config.tx.get_timeout,
-      }
-    );
-    if (!swapResponse.data) return null;
+          timeout: config.tx.get_timeout,
+        });
 
-    if (config.swap.verbose_log && config.swap.verbose_log === true) {
-      console.log(swapResponse.data);
+        if (!quoteResponse.data) return null;
+
+        // Serialize the quote into a swap transaction that can be submitted on chain
+        const swapTransaction = await axios.post<SerializedQuoteResponse>(
+          swapUrl,
+          JSON.stringify({
+            quoteResponse: quoteResponse.data,
+            userPublicKey: myWallet.publicKey.toString(),
+            wrapAndUnwrapSol: true,
+            dynamicSlippage: {
+              maxBps: 300,
+            },
+            prioritizationFeeLamports: {
+              priorityLevelWithMaxLamports: {
+                maxLamports: config.swap.prio_fee_max_lamports,
+                priorityLevel: config.swap.prio_level,
+              },
+            },
+          }),
+          {
+            headers: {
+              "Content-Type": "application/json",
+            },
+            timeout: config.tx.get_timeout,
+          }
+        );
+
+        if (!swapTransaction.data) return null;
+
+        // deserialize the transaction
+        const swapTransactionBuf = Buffer.from(swapTransaction.data.swapTransaction, "base64");
+        const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
+
+        // sign the transaction
+        transaction.sign([myWallet.payer]);
+
+        // Execute the transaction
+        const rawTransaction = transaction.serialize();
+        const txid = await connection.sendRawTransaction(rawTransaction, {
+          skipPreflight: true,
+          maxRetries: 2,
+        });
+
+        // Return null when no tx was returned
+        if (!txid) return null;
+
+        // Fetch the current status of a transaction signature
+        const latestBlockHash = await connection.getLatestBlockhash();
+        const conf = await connection.confirmTransaction({
+          blockhash: latestBlockHash.blockhash,
+          lastValidBlockHeight: latestBlockHash.lastValidBlockHeight,
+          signature: txid,
+        });
+
+        // Return null when an error occurred when confirming the transaction
+        if (conf.value.err) return null;
+
+        return txid;
+      } catch (error) {
+        if (axios.isAxiosError(error) && error.response?.status === 400) {
+          const errorData = error.response.data as ErrorResponse;
+          if (errorData.response?.data.errorCode === "TOKEN_NOT_TRADABLE") {
+            retryCount++;
+            await new Promise((resolve) => setTimeout(resolve, config.swap.token_not_tradable_400_error_delay));
+            continue;
+          }
+        }
+
+        console.error("Error while requesting a new swap quote:", error instanceof Error ? error.message : String(error));
+        if (config.swap.verbose_log) {
+          console.log("Verbose Error Message:");
+          if (axios.isAxiosError(error) && error.response) {
+            console.error("Error Status:", error.response.status);
+            console.error("Error Status Text:", error.response.statusText);
+            console.error("Error Data:", error.response.data);
+            console.error("Error Headers:", error.response.headers);
+          } else if (axios.isAxiosError(error) && error.request) {
+            console.error("No Response:", error.request);
+          } else {
+            console.error("Error Message:", String(error));
+          }
+        }
+        return null;
+      }
     }
 
-    serializedQuoteResponseData = swapResponse.data; // Store the successful response
-  } catch (error: any) {
-    console.error("Error while sending the swap quote:", error.message);
-    if (config.swap.verbose_log && config.swap.verbose_log === true) {
-      console.log("Verbose Error Message:");
-      if (error.response) {
-        // Server responded with a status other than 2xx
-        console.error("Error Status:", error.response.status);
-        console.error("Error Status Text:", error.response.statusText);
-        console.error("Error Data:", error.response.data); // API error message
-        console.error("Error Headers:", error.response.headers);
-      } else if (error.request) {
-        // Request was made but no response was received
-        console.error("No Response:", error.request);
-      } else {
-        // Other errors
-        console.error("Error Message:", error.message);
-      }
-    }
+    console.log("All attempts to fetch swap quote failed");
     return null;
-  }
-
-  // deserialize, sign and send the transaction
-  try {
-    if (!serializedQuoteResponseData) return null;
-    const swapTransactionBuf = Buffer.from(serializedQuoteResponseData.swapTransaction, "base64");
-    var transaction = VersionedTransaction.deserialize(swapTransactionBuf);
-
-    // sign the transaction
-    transaction.sign([myWallet.payer]);
-
-    // Create connection with RPC url
-    const connection = new Connection(rpcUrl);
-
-    // Execute the transaction
-    const rawTransaction = transaction.serialize();
-    const txid = await connection.sendRawTransaction(rawTransaction, {
-      skipPreflight: true, // If True, This will skip transaction simulation entirely.
-      maxRetries: 2,
-    });
-
-    // Return null when no tx was returned
-    if (!txid) {
-      return null;
-    }
-
-    // Fetch the current status of a transaction signature (processed, confirmed, finalized).
-    const latestBlockHash = await connection.getLatestBlockhash();
-    const conf = await connection.confirmTransaction({
-      blockhash: latestBlockHash.blockhash,
-      lastValidBlockHeight: latestBlockHash.lastValidBlockHeight,
-      signature: txid,
-    });
-
-    // Return null when an error occured when confirming the transaction
-    if (conf.value.err || conf.value.err !== null) {
-      return null;
-    }
-
-    return txid;
-  } catch (error: any) {
-    console.error("Error while signing and sending the transaction:", error.message);
-    if (config.swap.verbose_log && config.swap.verbose_log === true) {
-      console.log("Verbose Error Message:");
-      if (error.response) {
-        // Server responded with a status other than 2xx
-        console.error("Error Status:", error.response.status);
-        console.error("Error Status Text:", error.response.statusText);
-        console.error("Error Data:", error.response.data); // API error message
-        console.error("Error Headers:", error.response.headers);
-      } else if (error.request) {
-        // Request was made but no response was received
-        console.error("No Response:", error.request);
-      } else {
-        // Other errors
-        console.error("Error Message:", error.message);
-      }
-    }
+  } catch (error: unknown) {
+    console.error("Error while signing and sending the transaction:", error instanceof Error ? error.message : String(error));
     return null;
   }
 }
 
-export async function getRugCheckConfirmed(tokenMint: string): Promise<boolean> {
-  const rugResponse = await axios.get<RugResponseExtended>("https://api.rugcheck.xyz/v1/tokens/" + tokenMint + "/report", {
-    timeout: config.tx.get_timeout,
-  });
+export async function getRugCheckConfirmed(
+  tokenMint: string,
+  tokenName?: string,
+  tokenCreator?: string,
+  tokenSupply?: string,
+  lpAmount?: string,
+  lpProvider?: string
+): Promise<boolean> {
+  try {
+    // If only tokenMint is provided, use the old RugCheck API method
+    if (!tokenName && !tokenCreator) {
+      const rugResponse = await axios.get<RugResponseExtended>(
+        "https://api.rugcheck.xyz/v1/tokens/" + tokenMint + "/report",
+        { timeout: config.tx.get_timeout }
+      );
 
-  if (!rugResponse.data) return false;
+      if (!rugResponse.data) return false;
 
-  if (config.rug_check.verbose_log && config.rug_check.verbose_log === true) {
-    console.log(rugResponse.data);
-  }
+      // Show simulation mode notice
+      if (config.rug_check.simulation_mode) {
+        console.log("\n🔬 SIMULATION MODE: No actual swaps will be made");
+      }
 
-  // Extract information
-  const tokenReport: RugResponseExtended = rugResponse.data;
-  const tokenCreator = tokenReport.creator ? tokenReport.creator : tokenMint;
-  const mintAuthority = tokenReport.token.mintAuthority;
-  const freezeAuthority = tokenReport.token.freezeAuthority;
-  const isInitialized = tokenReport.token.isInitialized;
-  const supply = tokenReport.token.supply;
-  const decimals = tokenReport.token.decimals;
-  const tokenName = tokenReport.tokenMeta.name;
-  const tokenSymbol = tokenReport.tokenMeta.symbol;
-  const tokenMutable = tokenReport.tokenMeta.mutable;
-  let topHolders = tokenReport.topHolders;
-  const marketsLength = tokenReport.markets ? tokenReport.markets.length : 0;
-  const totalLPProviders = tokenReport.totalLPProviders;
-  const totalMarketLiquidity = tokenReport.totalMarketLiquidity;
-  const isRugged = tokenReport.rugged;
-  const rugScore = tokenReport.score;
-  const rugRisks = tokenReport.risks
-    ? tokenReport.risks
-    : [
+      // Extract information
+      const tokenReport = rugResponse.data;
+      const creator = tokenReport.creator || tokenMint;
+      const mintAuthority = tokenReport.token.mintAuthority;
+      const freezeAuthority = tokenReport.token.freezeAuthority;
+      const isInitialized = tokenReport.token.isInitialized;
+      const name = tokenReport.tokenMeta.name;
+      const symbol = tokenReport.tokenMeta.symbol;
+      const mutable = tokenReport.tokenMeta.mutable;
+      const topHolders = tokenReport.topHolders;
+      const marketsLength = tokenReport.markets?.length || 0;
+      const totalLPProviders = tokenReport.totalLPProviders;
+      const totalMarketLiquidity = tokenReport.totalMarketLiquidity;
+      const isRugged = tokenReport.rugged;
+      const rugScore = tokenReport.score;
+
+      // Debug token metadata
+      if (config.rug_check.verbose_log) {
+        console.log("\n🔍 Token Metadata Debug:");
+        console.log("- Token Name:", name);
+        console.log("- Token Symbol:", symbol);
+        console.log("- Token Creator:", creator);
+      }
+
+      // Set conditions
+      const conditions = [
         {
-          name: "Good",
-          value: "",
-          description: "",
-          score: 0,
-          level: "good",
+          check: !config.rug_check.allow_mint_authority && mintAuthority !== null,
+          message: "🚫 Mint authority should be null",
+        },
+        {
+          check: !config.rug_check.allow_not_initialized && !isInitialized,
+          message: "🚫 Token is not initialized",
+        },
+        {
+          check: !config.rug_check.allow_freeze_authority && freezeAuthority !== null,
+          message: "🚫 Freeze authority should be null",
+        },
+        {
+          check: !config.rug_check.allow_mutable && mutable !== false,
+          message: "🚫 Mutable should be false",
+        },
+        {
+          check: !config.rug_check.allow_insider_topholders && topHolders.some((holder) => holder.insider),
+          message: "🚫 Insider accounts should not be part of the top holders",
+        },
+        {
+          check: topHolders.some((holder) => holder.pct > config.rug_check.max_alowed_pct_topholders),
+          message: "🚫 An individual top holder cannot hold more than the allowed percentage of the total supply",
+        },
+        {
+          check: totalLPProviders < config.rug_check.min_total_lp_providers,
+          message: "🚫 Not enough LP Providers",
+        },
+        {
+          check: marketsLength < config.rug_check.min_total_markets,
+          message: "🚫 Not enough Markets",
+        },
+        {
+          check: totalMarketLiquidity < config.rug_check.min_total_market_Liquidity,
+          message: "🚫 Not enough Market Liquidity",
+        },
+        {
+          check: !config.rug_check.allow_rugged && isRugged,
+          message: "🚫 Token is rugged",
+        },
+        {
+          check: config.rug_check.block_symbols.includes(symbol),
+          message: "🚫 Symbol is blocked",
+        },
+        {
+          check: config.rug_check.block_names.includes(name),
+          message: "🚫 Name is blocked",
+        },
+        {
+          check: rugScore > config.rug_check.max_score && config.rug_check.max_score !== 0,
+          message: "🚫 Rug score too high",
         },
       ];
 
-  // Update topholders if liquidity pools are excluded
-  if (config.rug_check.exclude_lp_from_topholders) {
-    // local types
-    type Market = {
-      liquidityA?: string;
-      liquidityB?: string;
-    };
-
-    const markets: Market[] | undefined = tokenReport.markets;
-    if (markets) {
-      // Safely extract liquidity addresses from markets
-      const liquidityAddresses: string[] = (markets ?? [])
-        .flatMap((market) => [market.liquidityA, market.liquidityB])
-        .filter((address): address is string => !!address);
-
-      // Filter out topHolders that match any of the liquidity addresses
-      topHolders = topHolders.filter((holder) => !liquidityAddresses.includes(holder.address));
-    }
-  }
-
-  // Get config
-  const rugCheckConfig = config.rug_check;
-  const rugCheckLegacy = rugCheckConfig.legacy_not_allowed;
-
-  // Set conditions
-  const conditions = [
-    {
-      check: !rugCheckConfig.allow_mint_authority && mintAuthority !== null,
-      message: "🚫 Mint authority should be null",
-    },
-    {
-      check: !rugCheckConfig.allow_not_initialized && !isInitialized,
-      message: "🚫 Token is not initialized",
-    },
-    {
-      check: !rugCheckConfig.allow_freeze_authority && freezeAuthority !== null,
-      message: "🚫 Freeze authority should be null",
-    },
-    {
-      check: !rugCheckConfig.allow_mutable && tokenMutable !== false,
-      message: "🚫 Mutable should be false",
-    },
-    {
-      check: !rugCheckConfig.allow_insider_topholders && topHolders.some((holder) => holder.insider),
-      message: "🚫 Insider accounts should not be part of the top holders",
-    },
-    {
-      check: topHolders.some((holder) => holder.pct > rugCheckConfig.max_alowed_pct_topholders),
-      message: "🚫 An individual top holder cannot hold more than the allowed percentage of the total supply",
-    },
-    {
-      check: totalLPProviders < rugCheckConfig.min_total_lp_providers,
-      message: "🚫 Not enough LP Providers.",
-    },
-    {
-      check: marketsLength < rugCheckConfig.min_total_markets,
-      message: "🚫 Not enough Markets.",
-    },
-    {
-      check: totalMarketLiquidity < rugCheckConfig.min_total_market_Liquidity,
-      message: "🚫 Not enough Market Liquidity.",
-    },
-    {
-      check: !rugCheckConfig.allow_rugged && isRugged, //true
-      message: "🚫 Token is rugged",
-    },
-    {
-      check: rugCheckConfig.block_symbols.includes(tokenSymbol),
-      message: "🚫 Symbol is blocked",
-    },
-    {
-      check: rugCheckConfig.block_names.includes(tokenName),
-      message: "🚫 Name is blocked",
-    },
-    {
-      check: rugScore > rugCheckConfig.max_score && rugCheckConfig.max_score !== 0,
-      message: "🚫 Rug score to high.",
-    },
-    {
-      check: rugRisks.some((risk) => rugCheckLegacy.includes(risk.name)),
-      message: "🚫 Token has legacy risks that are not allowed.",
-    },
-  ];
-
-  // If tracking duplicate tokens is enabled
-  if (config.rug_check.block_returning_token_names || config.rug_check.block_returning_token_creators) {
-    // Get duplicates based on token min and creator
-    const duplicate = await selectTokenByNameAndCreator(tokenName, tokenCreator);
-
-    // Verify if duplicate token or creator was returned
-    if (duplicate.length !== 0) {
-      if (config.rug_check.block_returning_token_names && duplicate.some((token) => token.name === tokenName)) {
-        console.log("🚫 Token with this name was already created");
-        return false;
+      // Check for duplicate tokens
+      if (config.rug_check.block_returning_token_names || config.rug_check.block_returning_token_creators) {
+        const duplicate = await selectTokenByNameAndCreator(name, creator);
+        if (duplicate.length > 0) {
+          if (config.rug_check.block_returning_token_names && duplicate.some((token) => token.name === name)) {
+            console.log("🚫 Token with this name was already created");
+            return false;
+          }
+          if (config.rug_check.block_returning_token_creators && duplicate.some((token) => token.creator === creator)) {
+            console.log("🚫 Token from this creator was already created");
+            return false;
+          }
+        }
       }
-      if (config.rug_check.block_returning_token_creators && duplicate.some((token) => token.creator === tokenCreator)) {
-        console.log("🚫 Token from this creator was already created");
+
+      // Store token information
+      const newToken: NewTokenRecord = {
+        time: Date.now(),
+        mint: tokenMint,
+        name,
+        creator,
+      };
+      await insertNewToken(newToken);
+
+      // Validate conditions
+      for (const condition of conditions) {
+        if (condition.check) {
+          console.log(condition.message);
+          return false;
+        }
+      }
+
+      return true;
+    }
+
+    // New method with provided parameters
+    console.log("\n🔍 Starting Rug Check Analysis...");
+    
+    // Debug log configuration if enabled
+    if (config.rug_check.verbose_log) {
+      console.log({
+        tokenMint,
+        tokenName,
+        tokenCreator,
+        tokenSupply: formatNumber(tokenSupply || "0"),
+        lpAmount: formatNumber(lpAmount || "0"),
+        lpProvider
+      });
+    }
+
+    // Check if token is already tracked
+    const existingToken = await selectTokenByMint(tokenMint);
+    if (existingToken) {
+      console.log("✅ Token already tracked and verified");
+      return true;
+    }
+
+    // Check if similar token exists by name and creator
+    if (tokenName && tokenCreator) {
+      const similarToken = await selectTokenByNameAndCreator(tokenName, tokenCreator);
+      if (similarToken && config.rug_check.block_similar_tokens) {
+        console.log("⚠️ Similar token found - potential duplicate or relaunch");
+        console.log("❌ Blocked by similar token check");
         return false;
       }
     }
-  }
 
-  // Create new token record
-  const newToken: NewTokenRecord = {
-    time: Date.now(),
-    mint: tokenMint,
-    name: tokenName,
-    creator: tokenCreator,
-  };
-  await insertNewToken(newToken).catch((err) => {
-    if (config.rug_check.block_returning_token_names || config.rug_check.block_returning_token_creators) {
-      console.log("⛔ Unable to store new token for tracking duplicate tokens: " + err);
+    // Validate token supply
+    if (tokenSupply) {
+      const supplyBigInt = BigInt(tokenSupply);
+      if (supplyBigInt <= 0n) {
+        console.log("❌ Invalid token supply");
+        return false;
+      }
+
+      // Calculate and validate LP ratio
+      if (lpAmount) {
+        const lpBigInt = BigInt(lpAmount);
+        const lpRatio = Number(lpBigInt * 10000n / supplyBigInt) / 100;
+        
+        console.log(`\n📊 LP Analysis:`);
+        console.log(`- Total Supply: ${formatNumber(tokenSupply)}`);
+        console.log(`- LP Amount: ${formatNumber(lpAmount)}`);
+        console.log(`- LP Ratio: ${lpRatio}%`);
+
+        if (lpRatio < config.rug_check.min_lp_ratio) {
+          console.log(`❌ LP ratio too low (${lpRatio}% < ${config.rug_check.min_lp_ratio}%)`);
+          return false;
+        }
+      }
     }
-  });
 
-  //Validate conditions
-  for (const condition of conditions) {
-    if (condition.check) {
-      console.log(condition.message);
-      return false;
+    // Store token information if all checks pass
+    if (tokenName && tokenCreator) {
+      const newToken: NewTokenRecord = {
+        time: Date.now(),
+        mint: tokenMint,
+        name: tokenName,
+        creator: tokenCreator,
+      };
+      await insertNewToken(newToken);
+
+      // Create a holding record
+      const newHolding: HoldingRecord = {
+        Time: Date.now(),
+        Token: tokenMint,
+        TokenName: tokenName,
+        Balance: 0,
+        SolPaid: 0,
+        SolFeePaid: 0,
+        SolPaidUSDC: 0,
+        SolFeePaidUSDC: 0,
+        PerTokenPaidUSDC: 0,
+        Slot: 0,
+        Program: "N/A",
+      };
+      await insertHolding(newHolding);
     }
-  }
+    
+    console.log("✅ All rug checks passed successfully");
+    return true;
 
-  return true;
+  } catch (error: unknown) {
+    console.log("⛔ Error during rug check:", error instanceof Error ? error.message : String(error));
+    return false;
+  }
 }
 
 export async function fetchAndSaveSwapDetails(tx: string): Promise<boolean> {
   const txUrl = process.env.HELIUS_HTTPS_URI_TX || "";
   const priceUrl = process.env.JUP_HTTPS_PRICE_URI || "";
-  const rpcUrl = process.env.HELIUS_HTTPS_URI || "";
 
   try {
-    const response = await axios.post<any>(
+    const response = await axios.post<HeliusTransactionResponse>(
       txUrl,
       { transactions: [tx] },
       {
         headers: {
           "Content-Type": "application/json",
         },
-        timeout: 10000, // Timeout for each request
+        timeout: config.tx.get_timeout,
       }
     );
 
-    // Verify if we received tx reponse data
-    if (!response.data || response.data.length === 0) {
+    // Verify if we received tx response data
+    if (!response.data || !Array.isArray(response.data.transactions) || response.data.transactions.length === 0) {
       console.log("⛔ Could not fetch swap details: No response received from API.");
       return false;
     }
 
     // Safely access the event information
-    const transactions: TransactionDetailsResponseArray = response.data;
+    const transactions = response.data.transactions;
     const swapTransactionData: SwapEventDetailsResponse = {
       programInfo: transactions[0]?.events.swap.innerSwaps[0].programInfo,
       tokenInputs: transactions[0]?.events.swap.innerSwaps[0].tokenInputs,
@@ -518,7 +545,7 @@ export async function fetchAndSaveSwapDetails(tx: string): Promise<boolean> {
 
     // Get latest Sol Price
     const solMint = config.liquidity_pool.wsol_pc_mint;
-    const priceResponse = await axios.get<any>(priceUrl, {
+    const priceResponse = await axios.get<JupiterPriceResponse>(priceUrl, {
       params: {
         ids: solMint,
       },
@@ -529,15 +556,15 @@ export async function fetchAndSaveSwapDetails(tx: string): Promise<boolean> {
     if (!priceResponse.data.data[solMint]?.price) return false;
 
     // Calculate estimated price paid in sol
-    const solUsdcPrice = priceResponse.data.data[solMint]?.price;
+    const solUsdcPrice = priceResponse.data.data[solMint].price;
     const solPaidUsdc = swapTransactionData.tokenInputs[0].tokenAmount * solUsdcPrice;
     const solFeePaidUsdc = (swapTransactionData.fee / 1_000_000_000) * solUsdcPrice;
     const perTokenUsdcPrice = solPaidUsdc / swapTransactionData.tokenOutputs[0].tokenAmount;
 
     // Get token meta data
     let tokenName = "N/A";
-    const tokenData: NewTokenRecord[] = await selectTokenByMint(swapTransactionData.tokenOutputs[0].mint);
-    if (tokenData) {
+    const tokenData = await selectTokenByMint(swapTransactionData.tokenOutputs[0].mint);
+    if (tokenData && tokenData.length > 0) {
       tokenName = tokenData[0].name;
     }
 
@@ -556,29 +583,45 @@ export async function fetchAndSaveSwapDetails(tx: string): Promise<boolean> {
       Program: swapTransactionData.programInfo ? swapTransactionData.programInfo.source : "N/A",
     };
 
-    await insertHolding(newHolding).catch((err) => {
-      console.log("⛔ Database Error: " + err);
-      return false;
-    });
-
+    await insertHolding(newHolding);
     return true;
-  } catch (error: any) {
-    console.error("Error during request:", error.message);
+  } catch (error: unknown) {
+    console.error("Error during request:", error instanceof Error ? error.message : String(error));
     return false;
   }
 }
 
-export async function createSellTransaction(solMint: string, tokenMint: string, amount: string): Promise<string | null> {
+export async function createSellTransaction(solMint: string, tokenMint: string, amount: string): Promise<string | null | "TOKEN_ALREADY_SOLD"> {
   const quoteUrl = process.env.JUP_HTTPS_QUOTE_URI || "";
   const swapUrl = process.env.JUP_HTTPS_SWAP_URI || "";
   const rpcUrl = process.env.HELIUS_HTTPS_URI || "";
   const myWallet = new Wallet(Keypair.fromSecretKey(bs58.decode(process.env.PRIV_KEY_WALLET || "")));
+  const connection = new Connection(rpcUrl);
 
   try {
-    // @TODO: Verify if the user still holds this token to make sure we can sell it.
-    // https://docs.helius.dev/compression-and-das-api/digital-asset-standard-das-api/get-assets-by-owner
+    // Check token balance using the new utility
+    const { balance, accounts, details } = await checkTokenBalance(
+      connection,
+      myWallet.publicKey,
+      tokenMint
+    );
 
-    // Request a quote in order to swap SOL for new token
+    // Check if token exists with balance
+    if (balance <= 0n) {
+      console.log(`⚠️ Token ${tokenMint} has zero balance across ${accounts} accounts - Already sold elsewhere`);
+      await removeHolding(tokenMint);
+      return "TOKEN_ALREADY_SOLD";
+    }
+
+    // If we have detailed balance info, verify the amount to sell
+    if (details && config.swap.verbose_log) {
+      const totalUiAmount = details.reduce((sum, acc) => sum + acc.uiAmount, 0);
+      console.log(`\n💰 Selling Details:`);
+      console.log(`- Amount to sell: ${amount}`);
+      console.log(`- Available balance: ${totalUiAmount}`);
+    }
+
+    // Request a quote in order to swap token for SOL
     const quoteResponse = await axios.get<QuoteResponse>(quoteUrl, {
       params: {
         inputMint: tokenMint,
@@ -595,16 +638,11 @@ export async function createSellTransaction(solMint: string, tokenMint: string, 
     const swapTransaction = await axios.post<SerializedQuoteResponse>(
       swapUrl,
       JSON.stringify({
-        // quoteResponse from /quote api
         quoteResponse: quoteResponse.data,
-        // user public key to be used for the swap
         userPublicKey: myWallet.publicKey.toString(),
-        // auto wrap and unwrap SOL. default is true
         wrapAndUnwrapSol: true,
-        //dynamicComputeUnitLimit: true, // allow dynamic compute limit instead of max 1,400,000
         dynamicSlippage: {
-          // This will set an optimized slippage to ensure high success rate
-          maxBps: 300, // Make sure to set a reasonable cap here to prevent MEV
+          maxBps: 300,
         },
         prioritizationFeeLamports: {
           priorityLevelWithMaxLamports: {
@@ -620,51 +658,53 @@ export async function createSellTransaction(solMint: string, tokenMint: string, 
         timeout: config.tx.get_timeout,
       }
     );
+
     if (!swapTransaction.data) return null;
 
     // deserialize the transaction
     const swapTransactionBuf = Buffer.from(swapTransaction.data.swapTransaction, "base64");
-    var transaction = VersionedTransaction.deserialize(swapTransactionBuf);
+    const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
 
     // sign the transaction
     transaction.sign([myWallet.payer]);
 
-    // get the latest block hash
-    const connection = new Connection(rpcUrl);
-    const latestBlockHash = await connection.getLatestBlockhash();
-
     // Execute the transaction
     const rawTransaction = transaction.serialize();
     const txid = await connection.sendRawTransaction(rawTransaction, {
-      skipPreflight: true, // If True, This will skip transaction simulation entirely.
+      skipPreflight: true,
       maxRetries: 2,
     });
 
     // Return null when no tx was returned
-    if (!txid) {
-      return null;
-    }
+    if (!txid) return null;
 
-    // Fetch the current status of a transaction signature (processed, confirmed, finalized).
+    // Fetch the current status of a transaction signature
+    const latestBlockHash = await connection.getLatestBlockhash();
     const conf = await connection.confirmTransaction({
       blockhash: latestBlockHash.blockhash,
       lastValidBlockHeight: latestBlockHash.lastValidBlockHeight,
       signature: txid,
     });
 
-    // Return null when an error occured when confirming the transaction
-    if (conf.value.err || conf.value.err !== null) {
-      return null;
-    }
-
-    // Delete holding
-    removeHolding(tokenMint).catch((err) => {
-      console.log("⛔ Database Error: " + err);
-    });
+    // Return null when an error occurred when confirming the transaction
+    if (conf.value.err) return null;
 
     return txid;
-  } catch (error: any) {
-    console.error("Error while creating and submitting transaction:", error.message);
+  } catch (error: unknown) {
+    console.error("Error while signing and sending the transaction:", error instanceof Error ? error.message : String(error));
+    if (config.swap.verbose_log) {
+      console.log("Verbose Error Message:");
+      if (axios.isAxiosError(error) && error.response) {
+        console.error("Error Status:", error.response.status);
+        console.error("Error Status Text:", error.response.statusText);
+        console.error("Error Data:", error.response.data);
+        console.error("Error Headers:", error.response.headers);
+      } else if (axios.isAxiosError(error) && error.request) {
+        console.error("No Response:", error.request);
+      } else {
+        console.error("Error Message:", String(error));
+      }
+    }
     return null;
   }
 }
