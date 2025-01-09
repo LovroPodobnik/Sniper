@@ -284,3 +284,54 @@ export interface NewTokenRecord {
 }
 // Update to reflect an array of transactions
 export type TransactionDetailsResponseArray = TransactionDetailsResponse[];
+
+export interface RugCheckConfig {
+  verbose_log: boolean;
+  simulation_mode: boolean;
+  allow_mint_authority: boolean;
+  allow_not_initialized: boolean;
+  allow_freeze_authority: boolean;
+  allow_rugged: boolean;
+  allow_mutable: boolean;
+  allow_insider_topholders: boolean;
+  block_similar_tokens: boolean;
+  block_returning_token_names: boolean;
+  block_returning_token_creators: boolean;
+  block_symbols: string[];
+  block_names: string[];
+  max_alowed_pct_topholders: number;
+  min_total_lp_providers: number;
+  min_total_markets: number;
+  min_total_market_Liquidity: number;
+  max_score: number;
+  min_lp_ratio: number;
+  legacy_not_allowed: string[];
+  ignore_pump_fun: boolean;
+}
+
+export interface HeliusTransactionResponse {
+  transactions: TransactionDetailsResponse[];
+}
+
+export interface JupiterPriceResponse {
+  data: {
+    [key: string]: {
+      price: number;
+      id: string;
+    };
+  };
+}
+
+export interface ErrorResponse {
+  response?: {
+    status: number;
+    statusText: string;
+    data: {
+      errorCode?: string;
+      message?: string;
+    };
+    headers: Record<string, string>;
+  };
+  request?: unknown;
+  message: string;
+}

@@ -1,3 +1,5 @@
+import { RugCheckConfig } from "./types";
+
 export const config = {
   liquidity_pool: {
     radiyum_program_id: "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
@@ -12,7 +14,7 @@ export const config = {
     retry_delay: 500, // Delay between retries (0.5 seconds)
   },
   swap: {
-    verbose_log: false,
+    verbose_log: true,
     prio_fee_max_lamports: 1000000, // 0.001 SOL
     prio_level: "veryHigh", // If you want to land transaction fast, set this to use `veryHigh`. You will pay on average higher priority fee.
     amount: "10000000", //0.01 SOL
@@ -31,37 +33,26 @@ export const config = {
     track_public_wallet: "", // If set an additional log line will be shown with a link to track your wallet
   },
   rug_check: {
-    verbose_log: false,
+    verbose_log: true,
     simulation_mode: true,
-    // Dangerous
-    allow_mint_authority: false, // The mint authority is the address that has permission to mint (create) new tokens. Strongly Advised to set to false.
-    allow_not_initialized: false, // This indicates whether the token account is properly set up on the blockchain. Strongly Advised to set to false
-    allow_freeze_authority: false, // The freeze authority is the address that can freeze token transfers, effectively locking up funds. Strongly Advised to set to false
+    allow_mint_authority: false,
+    allow_not_initialized: false,
+    allow_freeze_authority: false,
     allow_rugged: false,
-    // Critical
     allow_mutable: false,
+    allow_insider_topholders: false,
+    block_similar_tokens: true,
     block_returning_token_names: true,
     block_returning_token_creators: true,
-    block_symbols: ["XXX"],
-    block_names: ["XXX"],
-    allow_insider_topholders: false, // Allow inseder accounts to be part of the topholders
-    max_alowed_pct_topholders: 1, // Max allowed percentage an individual topholder might hold
-    exclude_lp_from_topholders: false, // If true, Liquidity Pools will not be seen as top holders
-    // Warning
-    min_total_markets: 999,
-    min_total_lp_providers: 999,
-    min_total_market_Liquidity: 1000000,
-    // Misc
-    ignore_pump_fun: true,
-    max_score: 1, // Set to 0 to ignore
-    legacy_not_allowed: [
-      "Low Liquidity",
-      "Single holder ownership",
-      "High holder concentration",
-      "Freeze Authority still enabled",
-      "Large Amount of LP Unlocked",
-      "Copycat token",
-      "Low amount of LP Providers",
-    ],
-  },
+    block_symbols: [],
+    block_names: [],
+    max_alowed_pct_topholders: 10,
+    min_total_lp_providers: 1,
+    min_total_markets: 1,
+    min_total_market_Liquidity: 1,
+    max_score: 50,
+    min_lp_ratio: 5,
+    legacy_not_allowed: [],
+    ignore_pump_fun: true, // Whether to ignore tokens with "pump" in their name
+  } as RugCheckConfig,
 };
